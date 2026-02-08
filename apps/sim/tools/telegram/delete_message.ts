@@ -1,3 +1,4 @@
+import { ErrorExtractorId } from '@/tools/error-extractors'
 import type {
   TelegramDeleteMessageParams,
   TelegramDeleteMessageResponse,
@@ -13,6 +14,7 @@ export const telegramDeleteMessageTool: ToolConfig<
   description:
     'Delete messages in Telegram channels or chats through the Telegram Bot API. Requires the message ID of the message to delete.',
   version: '1.0.0',
+  errorExtractor: ErrorExtractorId.TELEGRAM_DESCRIPTION,
 
   params: {
     botToken: {
@@ -24,14 +26,14 @@ export const telegramDeleteMessageTool: ToolConfig<
     chatId: {
       type: 'string',
       required: true,
-      visibility: 'user-only',
-      description: 'Target Telegram chat ID',
+      visibility: 'user-or-llm',
+      description: 'Telegram chat ID (numeric, can be negative for groups)',
     },
     messageId: {
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Message ID to delete',
+      description: 'Telegram message ID (numeric identifier of the message to delete)',
     },
   },
 
@@ -50,10 +52,16 @@ export const telegramDeleteMessageTool: ToolConfig<
 
   transformResponse: async (response: Response) => {
     const data = await response.json()
+
+    if (!data.ok) {
+      const errorMessage = data.description || data.error || 'Failed to delete message'
+      throw new Error(errorMessage)
+    }
+
     return {
-      success: data.ok,
+      success: true,
       output: {
-        message: data.ok ? 'Message deleted successfully' : 'Failed to delete message',
+        message: 'Message deleted successfully',
         data: {
           ok: data.ok,
           deleted: data.result,

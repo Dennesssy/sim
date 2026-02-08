@@ -1,4 +1,5 @@
-import type { ToolResponse } from '@/tools/types'
+import type { UserFile } from '@/executor/types'
+import type { ToolFileData, ToolResponse } from '@/tools/types'
 
 export interface TelegramMessage {
   message_id: number
@@ -115,6 +116,11 @@ export interface TelegramSendAnimationParams extends TelegramAuthParams {
   caption?: string
 }
 
+export interface TelegramSendDocumentParams extends TelegramAuthParams {
+  files?: UserFile[]
+  caption?: string
+}
+
 export interface TelegramDeleteMessageParams extends TelegramAuthParams {
   messageId: number
 }
@@ -157,11 +163,20 @@ export interface TelegramSendPhotoResponse extends ToolResponse {
   }
 }
 
+export interface TelegramSendDocumentResponse extends ToolResponse {
+  output: {
+    message: string
+    data?: TelegramMedia
+    files?: ToolFileData[]
+  }
+}
+
 export type TelegramResponse =
   | TelegramSendMessageResponse
   | TelegramSendPhotoResponse
   | TelegramSendAudioResponse
   | TelegramSendMediaResponse
+  | TelegramSendDocumentResponse
   | TelegramDeleteMessageResponse
 
 // Legacy type for backwards compatibility

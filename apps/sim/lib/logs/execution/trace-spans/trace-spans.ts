@@ -1,9 +1,42 @@
-import { createLogger } from '@/lib/logs/console/logger'
+import { createLogger } from '@sim/logger'
 import type { ToolCall, TraceSpan } from '@/lib/logs/types'
-import { isWorkflowBlockType } from '@/executor/consts'
+import { isWorkflowBlockType, stripCustomToolPrefix } from '@/executor/constants'
 import type { ExecutionResult } from '@/executor/types'
 
 const logger = createLogger('TraceSpans')
+
+/**
+ * Keys that should be recursively filtered from output display.
+ * These are internal fields used for execution tracking that shouldn't be shown to users.
+ */
+const HIDDEN_OUTPUT_KEYS = new Set(['childTraceSpans'])
+
+/**
+ * Recursively filters hidden keys from nested objects for cleaner display.
+ * Used by both executor (for log output) and UI (for display).
+ */
+export function filterHiddenOutputKeys(value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => filterHiddenOutputKeys(item))
+  }
+
+  if (typeof value === 'object') {
+    const filtered: Record<string, unknown> = {}
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      if (HIDDEN_OUTPUT_KEYS.has(key)) {
+        continue
+      }
+      filtered[key] = filterHiddenOutputKeys(val)
+    }
+    return filtered
+  }
+
+  return value
+}
 
 function isSyntheticWorkflowWrapper(span: TraceSpan | undefined): boolean {
   if (!span || span.type !== 'workflow') return false
@@ -21,41 +54,32 @@ function flattenWorkflowChildren(spans: TraceSpan[]): TraceSpan[] {
       return
     }
 
-    const processedSpan = ensureNestedWorkflowsProcessed(span)
+    const processedSpan: TraceSpan = { ...span }
+
+    const directChildren = Array.isArray(span.children) ? span.children : []
+    const outputChildren =
+      span.output &&
+      typeof span.output === 'object' &&
+      Array.isArray((span.output as { childTraceSpans?: TraceSpan[] }).childTraceSpans)
+        ? ((span.output as { childTraceSpans?: TraceSpan[] }).childTraceSpans as TraceSpan[])
+        : []
+
+    const allChildren = [...directChildren, ...outputChildren]
+    if (allChildren.length > 0) {
+      processedSpan.children = flattenWorkflowChildren(allChildren)
+    }
+
+    if (outputChildren.length > 0 && processedSpan.output) {
+      const { childTraceSpans: _, ...cleanOutput } = processedSpan.output as {
+        childTraceSpans?: TraceSpan[]
+      } & Record<string, unknown>
+      processedSpan.output = cleanOutput
+    }
+
     flattened.push(processedSpan)
   })
 
   return flattened
-}
-
-function getTraceSpanKey(span: TraceSpan): string {
-  if (span.id) {
-    return span.id
-  }
-
-  const name = span.name || 'span'
-  const start = span.startTime || 'unknown-start'
-  const end = span.endTime || 'unknown-end'
-
-  return `${name}|${start}|${end}`
-}
-
-function mergeTraceSpanChildren(...childGroups: TraceSpan[][]): TraceSpan[] {
-  const merged: TraceSpan[] = []
-  const seen = new Set<string>()
-
-  childGroups.forEach((group) => {
-    group.forEach((child) => {
-      const key = getTraceSpanKey(child)
-      if (seen.has(key)) {
-        return
-      }
-      seen.add(key)
-      merged.push(child)
-    })
-  })
-
-  return merged
 }
 
 export function buildTraceSpans(result: ExecutionResult): {
@@ -88,6 +112,26 @@ export function buildTraceSpans(result: ExecutionResult): {
     const duration = log.durationMs || 0
 
     let output = log.output || {}
+    let childWorkflowSnapshotId: string | undefined
+    let childWorkflowId: string | undefined
+
+    if (output && typeof output === 'object') {
+      const outputRecord = output as Record<string, unknown>
+      childWorkflowSnapshotId =
+        typeof outputRecord.childWorkflowSnapshotId === 'string'
+          ? outputRecord.childWorkflowSnapshotId
+          : undefined
+      childWorkflowId =
+        typeof outputRecord.childWorkflowId === 'string' ? outputRecord.childWorkflowId : undefined
+      if (childWorkflowSnapshotId || childWorkflowId) {
+        const {
+          childWorkflowSnapshotId: _childSnapshotId,
+          childWorkflowId: _childWorkflowId,
+          ...outputRest
+        } = outputRecord
+        output = outputRest
+      }
+    }
 
     if (log.error) {
       output = {
@@ -110,6 +154,11 @@ export function buildTraceSpans(result: ExecutionResult): {
       blockId: log.blockId,
       input: log.input || {},
       output: output,
+      ...(childWorkflowSnapshotId ? { childWorkflowSnapshotId } : {}),
+      ...(childWorkflowId ? { childWorkflowId } : {}),
+      ...(log.loopId && { loopId: log.loopId }),
+      ...(log.parallelId && { parallelId: log.parallelId }),
+      ...(log.iterationIndex !== undefined && { iterationIndex: log.iterationIndex }),
     }
 
     if (log.output?.providerTiming) {
@@ -184,6 +233,17 @@ export function buildTraceSpans(result: ExecutionResult): {
       const timeSegments = log.output.providerTiming.timeSegments
       const toolCallsData = log.output?.toolCalls?.list || log.output?.toolCalls || []
 
+      const toolCallsByName = new Map<string, Array<Record<string, unknown>>>()
+      for (const tc of toolCallsData as Array<{ name?: string; [key: string]: unknown }>) {
+        const normalizedName = stripCustomToolPrefix(tc.name || '')
+        if (!toolCallsByName.has(normalizedName)) {
+          toolCallsByName.set(normalizedName, [])
+        }
+        toolCallsByName.get(normalizedName)!.push(tc)
+      }
+
+      const toolCallIndices = new Map<string, number>()
+
       span.children = timeSegments.map(
         (
           segment: {
@@ -210,14 +270,25 @@ export function buildTraceSpans(result: ExecutionResult): {
           }
 
           if (segment.type === 'tool') {
-            const matchingToolCall = toolCallsData.find(
-              (tc: { name?: string; [key: string]: unknown }) =>
-                tc.name === segment.name || stripCustomToolPrefix(tc.name || '') === segment.name
-            )
+            const normalizedName = stripCustomToolPrefix(segment.name || '')
+
+            const toolCallsForName = toolCallsByName.get(normalizedName) || []
+            const currentIndex = toolCallIndices.get(normalizedName) || 0
+            const matchingToolCall = toolCallsForName[currentIndex] as
+              | {
+                  error?: string
+                  arguments?: Record<string, unknown>
+                  input?: Record<string, unknown>
+                  result?: Record<string, unknown>
+                  output?: Record<string, unknown>
+                }
+              | undefined
+
+            toolCallIndices.set(normalizedName, currentIndex + 1)
 
             return {
               id: `${span.id}-segment-${index}`,
-              name: stripCustomToolPrefix(segment.name || ''),
+              name: normalizedName,
               type: 'tool',
               duration: segment.duration,
               startTime: segmentStartTime,
@@ -315,14 +386,24 @@ export function buildTraceSpans(result: ExecutionResult): {
       }
     }
 
-    if (
-      isWorkflowBlockType(log.blockType) &&
-      log.output?.childTraceSpans &&
-      Array.isArray(log.output.childTraceSpans)
-    ) {
-      const childTraceSpans = log.output.childTraceSpans as TraceSpan[]
-      const flattenedChildren = flattenWorkflowChildren(childTraceSpans)
-      span.children = mergeTraceSpanChildren(span.children || [], flattenedChildren)
+    if (isWorkflowBlockType(log.blockType)) {
+      const childTraceSpans = Array.isArray(log.childTraceSpans)
+        ? log.childTraceSpans
+        : Array.isArray(log.output?.childTraceSpans)
+          ? (log.output.childTraceSpans as TraceSpan[])
+          : null
+
+      if (childTraceSpans) {
+        const flattenedChildren = flattenWorkflowChildren(childTraceSpans)
+        span.children = flattenedChildren
+
+        if (span.output && typeof span.output === 'object' && 'childTraceSpans' in span.output) {
+          const { childTraceSpans: _, ...cleanOutput } = span.output as {
+            childTraceSpans?: TraceSpan[]
+          } & Record<string, unknown>
+          span.output = cleanOutput
+        }
+      }
     }
 
     spanMap.set(spanId, span)
@@ -468,8 +549,10 @@ function groupIterationBlocks(spans: TraceSpan[]): TraceSpan[] {
     }
   })
 
+  // Include loop/parallel spans that have errors (e.g., validation errors that blocked execution)
+  // These won't have iteration children, so they should appear directly in results
   const nonIterationContainerSpans = normalSpans.filter(
-    (span) => span.type !== 'parallel' && span.type !== 'loop'
+    (span) => (span.type !== 'parallel' && span.type !== 'loop') || span.status === 'error'
   )
 
   if (iterationSpans.length > 0) {
@@ -483,6 +566,12 @@ function groupIterationBlocks(spans: TraceSpan[]): TraceSpan[] {
       }
     >()
 
+    // Track sequential numbers for loops and parallels
+    const loopNumbers = new Map<string, number>()
+    const parallelNumbers = new Map<string, number>()
+    let loopCounter = 1
+    let parallelCounter = 1
+
     iterationSpans.forEach((span) => {
       const iterationMatch = span.name.match(/^(.+) \(iteration (\d+)\)$/)
       if (iterationMatch) {
@@ -490,27 +579,81 @@ function groupIterationBlocks(spans: TraceSpan[]): TraceSpan[] {
         let containerId = 'unknown'
         let containerName = 'Unknown'
 
-        if (span.blockId?.includes('_parallel_')) {
-          const parallelMatch = span.blockId.match(/_parallel_([^_]+)_iteration_/)
-          if (parallelMatch) {
-            containerType = 'parallel'
-            containerId = parallelMatch[1]
+        // Use the loopId/parallelId from the span metadata (set during execution)
+        if (span.parallelId) {
+          containerType = 'parallel'
+          containerId = span.parallelId
 
-            const parallelBlock = normalSpans.find(
-              (s) => s.blockId === containerId && s.type === 'parallel'
-            )
-            containerName = parallelBlock?.name || `Parallel ${containerId}`
+          const parallelBlock = normalSpans.find(
+            (s) => s.blockId === containerId && s.type === 'parallel'
+          )
+
+          // Use custom name if available, otherwise assign sequential number
+          if (parallelBlock?.name) {
+            containerName = parallelBlock.name
+          } else {
+            if (!parallelNumbers.has(containerId)) {
+              parallelNumbers.set(containerId, parallelCounter++)
+            }
+            containerName = `Parallel ${parallelNumbers.get(containerId)}`
+          }
+        } else if (span.loopId) {
+          containerType = 'loop'
+          containerId = span.loopId
+
+          const loopBlock = normalSpans.find((s) => s.blockId === containerId && s.type === 'loop')
+
+          // Use custom name if available, otherwise assign sequential number
+          if (loopBlock?.name) {
+            containerName = loopBlock.name
+          } else {
+            if (!loopNumbers.has(containerId)) {
+              loopNumbers.set(containerId, loopCounter++)
+            }
+            containerName = `Loop ${loopNumbers.get(containerId)}`
           }
         } else {
-          containerType = 'loop'
+          // Fallback to old logic if metadata is missing
+          if (span.blockId?.includes('_parallel_')) {
+            const parallelMatch = span.blockId.match(/_parallel_([^_]+)_iteration_/)
+            if (parallelMatch) {
+              containerType = 'parallel'
+              containerId = parallelMatch[1]
 
-          const loopBlock = normalSpans.find((s) => s.type === 'loop')
-          if (loopBlock) {
-            containerId = loopBlock.blockId || 'loop-1'
-            containerName = loopBlock.name || `Loop ${loopBlock.blockId || '1'}`
+              const parallelBlock = normalSpans.find(
+                (s) => s.blockId === containerId && s.type === 'parallel'
+              )
+
+              // Use custom name if available, otherwise assign sequential number
+              if (parallelBlock?.name) {
+                containerName = parallelBlock.name
+              } else {
+                if (!parallelNumbers.has(containerId)) {
+                  parallelNumbers.set(containerId, parallelCounter++)
+                }
+                containerName = `Parallel ${parallelNumbers.get(containerId)}`
+              }
+            }
           } else {
-            containerId = 'loop-1'
-            containerName = 'Loop 1'
+            containerType = 'loop'
+            // Find the first loop as fallback
+            const loopBlock = normalSpans.find((s) => s.type === 'loop')
+            if (loopBlock?.blockId) {
+              containerId = loopBlock.blockId
+
+              // Use custom name if available, otherwise assign sequential number
+              if (loopBlock.name) {
+                containerName = loopBlock.name
+              } else {
+                if (!loopNumbers.has(containerId)) {
+                  loopNumbers.set(containerId, loopCounter++)
+                }
+                containerName = `Loop ${loopNumbers.get(containerId)}`
+              }
+            } else {
+              containerId = 'loop-1'
+              containerName = 'Loop 1'
+            }
           }
         }
 
@@ -659,47 +802,4 @@ function groupIterationBlocks(spans: TraceSpan[]): TraceSpan[] {
   result.sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
 
   return result
-}
-
-function ensureNestedWorkflowsProcessed(span: TraceSpan): TraceSpan {
-  const processedSpan: TraceSpan = { ...span }
-
-  if (processedSpan.output && typeof processedSpan.output === 'object') {
-    processedSpan.output = { ...processedSpan.output }
-  }
-
-  const normalizedChildren = Array.isArray(span.children)
-    ? span.children.map((child) => ensureNestedWorkflowsProcessed(child))
-    : []
-
-  const outputChildSpans = (() => {
-    if (!processedSpan.output || typeof processedSpan.output !== 'object') {
-      return [] as TraceSpan[]
-    }
-
-    const maybeChildSpans = (processedSpan.output as { childTraceSpans?: TraceSpan[] })
-      .childTraceSpans
-    if (!Array.isArray(maybeChildSpans) || maybeChildSpans.length === 0) {
-      return [] as TraceSpan[]
-    }
-
-    return flattenWorkflowChildren(maybeChildSpans)
-  })()
-
-  const mergedChildren = mergeTraceSpanChildren(normalizedChildren, outputChildSpans)
-
-  if (processedSpan.output && 'childTraceSpans' in processedSpan.output) {
-    const { childTraceSpans, ...cleanOutput } = processedSpan.output as {
-      childTraceSpans?: TraceSpan[]
-    } & Record<string, unknown>
-    processedSpan.output = cleanOutput
-  }
-
-  processedSpan.children = mergedChildren.length > 0 ? mergedChildren : undefined
-
-  return processedSpan
-}
-
-export function stripCustomToolPrefix(name: string) {
-  return name.startsWith('custom_') ? name.replace('custom_', '') : name
 }

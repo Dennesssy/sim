@@ -1,14 +1,27 @@
 import { db } from '@sim/db'
-import { webhook, workflow } from '@sim/db/schema'
-import { and, desc, eq } from 'drizzle-orm'
+import { webhook, workflow, workflowDeploymentVersion } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { and, desc, eq, isNull, or } from 'drizzle-orm'
 import { nanoid } from 'nanoid'
 import { type NextRequest, NextResponse } from 'next/server'
 import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { getUserEntityPermissions } from '@/lib/permissions/utils'
-import { getBaseUrl } from '@/lib/urls/utils'
-import { generateRequestId } from '@/lib/utils'
-import { getOAuthToken } from '@/app/api/auth/oauth/utils'
+import { PlatformEvents } from '@/lib/core/telemetry'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { getProviderIdFromServiceId } from '@/lib/oauth'
+import { resolveEnvVarsInObject } from '@/lib/webhooks/env-resolver'
+import {
+  cleanupExternalWebhook,
+  createExternalWebhookSubscription,
+} from '@/lib/webhooks/provider-subscriptions'
+import { mergeNonUserFields } from '@/lib/webhooks/utils'
+import {
+  configureGmailPolling,
+  configureOutlookPolling,
+  configureRssPolling,
+  syncWebhooksForCredentialSet,
+} from '@/lib/webhooks/utils.server'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
+import { extractCredentialSetId, isCredentialSetValue } from '@/executor/constants'
 
 const logger = createLogger('WebhooksAPI')
 
@@ -25,7 +38,6 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Get query parameters
     const { searchParams } = new URL(request.url)
     const workflowId = searchParams.get('workflowId')
     const blockId = searchParams.get('blockId')
@@ -72,7 +84,23 @@ export async function GET(request: NextRequest) {
         })
         .from(webhook)
         .innerJoin(workflow, eq(webhook.workflowId, workflow.id))
-        .where(and(eq(webhook.workflowId, workflowId), eq(webhook.blockId, blockId)))
+        .leftJoin(
+          workflowDeploymentVersion,
+          and(
+            eq(workflowDeploymentVersion.workflowId, workflow.id),
+            eq(workflowDeploymentVersion.isActive, true)
+          )
+        )
+        .where(
+          and(
+            eq(webhook.workflowId, workflowId),
+            eq(webhook.blockId, blockId),
+            or(
+              eq(webhook.deploymentVersionId, workflowDeploymentVersion.id),
+              and(isNull(workflowDeploymentVersion.id), isNull(webhook.deploymentVersionId))
+            )
+          )
+        )
         .orderBy(desc(webhook.updatedAt))
 
       logger.info(
@@ -138,7 +166,7 @@ export async function POST(request: NextRequest) {
     const isCredentialBased = credentialBasedProviders.includes(provider)
     // Treat Microsoft Teams chat subscription as credential-based for path generation purposes
     const isMicrosoftTeamsChatSubscription =
-      provider === 'microsoftteams' &&
+      provider === 'microsoft-teams' &&
       typeof providerConfig === 'object' &&
       providerConfig?.triggerId === 'microsoftteams_chat_subscription'
 
@@ -150,7 +178,23 @@ export async function POST(request: NextRequest) {
           const existingForBlock = await db
             .select({ id: webhook.id, path: webhook.path })
             .from(webhook)
-            .where(and(eq(webhook.workflowId, workflowId), eq(webhook.blockId, blockId)))
+            .leftJoin(
+              workflowDeploymentVersion,
+              and(
+                eq(workflowDeploymentVersion.workflowId, workflowId),
+                eq(workflowDeploymentVersion.isActive, true)
+              )
+            )
+            .where(
+              and(
+                eq(webhook.workflowId, workflowId),
+                eq(webhook.blockId, blockId),
+                or(
+                  eq(webhook.deploymentVersionId, workflowDeploymentVersion.id),
+                  and(isNull(workflowDeploymentVersion.id), isNull(webhook.deploymentVersionId))
+                )
+              )
+            )
             .limit(1)
 
           if (existingForBlock.length > 0) {
@@ -226,7 +270,23 @@ export async function POST(request: NextRequest) {
       const existingForBlock = await db
         .select({ id: webhook.id })
         .from(webhook)
-        .where(and(eq(webhook.workflowId, workflowId), eq(webhook.blockId, blockId)))
+        .leftJoin(
+          workflowDeploymentVersion,
+          and(
+            eq(workflowDeploymentVersion.workflowId, workflowId),
+            eq(workflowDeploymentVersion.isActive, true)
+          )
+        )
+        .where(
+          and(
+            eq(webhook.workflowId, workflowId),
+            eq(webhook.blockId, blockId),
+            or(
+              eq(webhook.deploymentVersionId, workflowDeploymentVersion.id),
+              and(isNull(workflowDeploymentVersion.id), isNull(webhook.deploymentVersionId))
+            )
+          )
+        )
         .limit(1)
       if (existingForBlock.length > 0) {
         targetWebhookId = existingForBlock[0].id
@@ -251,126 +311,268 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    let savedWebhook: any = null // Variable to hold the result of save/update
+    let savedWebhook: any = null
+    const originalProviderConfig = providerConfig || {}
+    let resolvedProviderConfig = await resolveEnvVarsInObject(
+      originalProviderConfig,
+      userId,
+      workflowRecord.workspaceId || undefined
+    )
 
-    // Use the original provider config - Gmail/Outlook configuration functions will inject userId automatically
-    const finalProviderConfig = providerConfig
+    // --- Credential Set Handling ---
+    // For credential sets, we fan out to create one webhook per credential at save time.
+    // This applies to all OAuth-based triggers, not just polling ones.
+    // Check for credentialSetId directly (frontend may already extract it) or credential set value in credential fields
+    const rawCredentialId = (resolvedProviderConfig?.credentialId ||
+      resolvedProviderConfig?.triggerCredentials) as string | undefined
+    const directCredentialSetId = resolvedProviderConfig?.credentialSetId as string | undefined
 
-    if (targetWebhookId) {
-      logger.info(`[${requestId}] Updating existing webhook for path: ${finalPath}`, {
-        webhookId: targetWebhookId,
-        provider,
-        hasCredentialId: !!(finalProviderConfig as any)?.credentialId,
-        credentialId: (finalProviderConfig as any)?.credentialId,
-      })
-      const updatedResult = await db
-        .update(webhook)
-        .set({
-          blockId,
-          provider,
-          providerConfig: finalProviderConfig,
-          isActive: true,
-          updatedAt: new Date(),
-        })
-        .where(eq(webhook.id, targetWebhookId))
-        .returning()
-      savedWebhook = updatedResult[0]
-      logger.info(`[${requestId}] Webhook updated successfully`, {
-        webhookId: savedWebhook.id,
-        savedProviderConfig: savedWebhook.providerConfig,
-      })
-    } else {
-      // Create a new webhook
-      const webhookId = nanoid()
-      logger.info(`[${requestId}] Creating new webhook with ID: ${webhookId}`)
-      const newResult = await db
-        .insert(webhook)
-        .values({
-          id: webhookId,
-          workflowId,
-          blockId,
-          path: finalPath,
-          provider,
-          providerConfig: finalProviderConfig,
-          isActive: true,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .returning()
-      savedWebhook = newResult[0]
-    }
+    if (directCredentialSetId || rawCredentialId) {
+      const credentialSetId =
+        directCredentialSetId ||
+        (rawCredentialId && isCredentialSetValue(rawCredentialId)
+          ? extractCredentialSetId(rawCredentialId)
+          : null)
 
-    // --- Attempt to create webhook in Airtable if provider is 'airtable' ---
-    if (savedWebhook && provider === 'airtable') {
-      logger.info(
-        `[${requestId}] Airtable provider detected. Attempting to create webhook in Airtable.`
-      )
-      try {
-        await createAirtableWebhookSubscription(request, userId, savedWebhook, requestId)
-      } catch (err) {
-        logger.error(`[${requestId}] Error creating Airtable webhook`, err)
-        return NextResponse.json(
-          {
-            error: 'Failed to create webhook in Airtable',
-            details: err instanceof Error ? err.message : 'Unknown error',
-          },
-          { status: 500 }
+      if (credentialSetId) {
+        logger.info(
+          `[${requestId}] Credential set detected for ${provider} trigger. Syncing webhooks for set ${credentialSetId}`
         )
+
+        const oauthProviderId = getProviderIdFromServiceId(provider)
+
+        const {
+          credentialId: _cId,
+          triggerCredentials: _tCred,
+          credentialSetId: _csId,
+          ...baseProviderConfig
+        } = resolvedProviderConfig
+
+        try {
+          const syncResult = await syncWebhooksForCredentialSet({
+            workflowId,
+            blockId,
+            provider,
+            basePath: finalPath,
+            credentialSetId,
+            oauthProviderId,
+            providerConfig: baseProviderConfig,
+            requestId,
+          })
+
+          if (syncResult.webhooks.length === 0) {
+            logger.error(
+              `[${requestId}] No webhooks created for credential set - no valid credentials found`
+            )
+            return NextResponse.json(
+              {
+                error: `No valid credentials found in credential set for ${provider}`,
+                details: 'Please ensure team members have connected their accounts',
+              },
+              { status: 400 }
+            )
+          }
+
+          // Configure each new webhook (for providers that need configuration)
+          const pollingProviders = ['gmail', 'outlook']
+          const needsConfiguration = pollingProviders.includes(provider)
+
+          if (needsConfiguration) {
+            const configureFunc =
+              provider === 'gmail' ? configureGmailPolling : configureOutlookPolling
+            const configureErrors: string[] = []
+
+            for (const wh of syncResult.webhooks) {
+              if (wh.isNew) {
+                // Fetch the webhook data for configuration
+                const webhookRows = await db
+                  .select()
+                  .from(webhook)
+                  .where(eq(webhook.id, wh.id))
+                  .limit(1)
+
+                if (webhookRows.length > 0) {
+                  const success = await configureFunc(webhookRows[0], requestId)
+                  if (!success) {
+                    configureErrors.push(
+                      `Failed to configure webhook for credential ${wh.credentialId}`
+                    )
+                    logger.warn(
+                      `[${requestId}] Failed to configure ${provider} polling for webhook ${wh.id}`
+                    )
+                  }
+                }
+              }
+            }
+
+            if (
+              configureErrors.length > 0 &&
+              configureErrors.length === syncResult.webhooks.length
+            ) {
+              // All configurations failed - roll back
+              logger.error(`[${requestId}] All webhook configurations failed, rolling back`)
+              for (const wh of syncResult.webhooks) {
+                await db.delete(webhook).where(eq(webhook.id, wh.id))
+              }
+              return NextResponse.json(
+                {
+                  error: `Failed to configure ${provider} polling`,
+                  details: 'Please check account permissions and try again',
+                },
+                { status: 500 }
+              )
+            }
+          }
+
+          logger.info(
+            `[${requestId}] Successfully synced ${syncResult.webhooks.length} webhooks for credential set ${credentialSetId}`
+          )
+
+          // Return the first webhook as the "primary" for the UI
+          // The UI will query by credentialSetId to get all of them
+          const primaryWebhookRows = await db
+            .select()
+            .from(webhook)
+            .where(eq(webhook.id, syncResult.webhooks[0].id))
+            .limit(1)
+
+          return NextResponse.json(
+            {
+              webhook: primaryWebhookRows[0],
+              credentialSetInfo: {
+                credentialSetId,
+                totalWebhooks: syncResult.webhooks.length,
+                created: syncResult.created,
+                updated: syncResult.updated,
+                deleted: syncResult.deleted,
+              },
+            },
+            { status: syncResult.created > 0 ? 201 : 200 }
+          )
+        } catch (err) {
+          logger.error(`[${requestId}] Error syncing webhooks for credential set`, err)
+          return NextResponse.json(
+            {
+              error: `Failed to configure ${provider} webhook`,
+              details: err instanceof Error ? err.message : 'Unknown error',
+            },
+            { status: 500 }
+          )
+        }
       }
     }
-    // --- End Airtable specific logic ---
+    // --- End Credential Set Handling ---
 
-    // --- Microsoft Teams subscription setup ---
-    if (savedWebhook && provider === 'microsoftteams') {
-      const { createTeamsSubscription } = await import('@/lib/webhooks/webhook-helpers')
-      logger.info(`[${requestId}] Creating Teams subscription for webhook ${savedWebhook.id}`)
+    let externalSubscriptionCreated = false
+    const createTempWebhookData = (providerConfigOverride = resolvedProviderConfig) => ({
+      id: targetWebhookId || nanoid(),
+      path: finalPath,
+      provider,
+      providerConfig: providerConfigOverride,
+    })
 
-      const success = await createTeamsSubscription(
+    const userProvided = originalProviderConfig as Record<string, unknown>
+    const configToSave: Record<string, unknown> = { ...userProvided }
+
+    try {
+      const result = await createExternalWebhookSubscription(
         request,
-        savedWebhook,
+        createTempWebhookData(),
         workflowRecord,
+        userId,
         requestId
       )
-
-      if (!success) {
-        return NextResponse.json(
-          {
-            error: 'Failed to create Teams subscription',
-            details: 'Could not create subscription with Microsoft Graph API',
-          },
-          { status: 500 }
-        )
-      }
+      const updatedConfig = result.updatedProviderConfig as Record<string, unknown>
+      mergeNonUserFields(configToSave, updatedConfig, userProvided)
+      resolvedProviderConfig = updatedConfig
+      externalSubscriptionCreated = result.externalSubscriptionCreated
+    } catch (err) {
+      logger.error(`[${requestId}] Error creating external webhook subscription`, err)
+      return NextResponse.json(
+        {
+          error: 'Failed to create external webhook subscription',
+          details: err instanceof Error ? err.message : 'Unknown error',
+        },
+        { status: 500 }
+      )
     }
-    // --- End Teams subscription setup ---
 
-    // --- Telegram webhook setup ---
-    if (savedWebhook && provider === 'telegram') {
-      const { createTelegramWebhook } = await import('@/lib/webhooks/webhook-helpers')
-      logger.info(`[${requestId}] Creating Telegram webhook for webhook ${savedWebhook.id}`)
-
-      const success = await createTelegramWebhook(request, savedWebhook, requestId)
-
-      if (!success) {
-        return NextResponse.json(
-          {
-            error: 'Failed to create Telegram webhook',
-          },
-          { status: 500 }
-        )
+    try {
+      if (targetWebhookId) {
+        logger.info(`[${requestId}] Updating existing webhook for path: ${finalPath}`, {
+          webhookId: targetWebhookId,
+          provider,
+          hasCredentialId: !!(configToSave as any)?.credentialId,
+          credentialId: (configToSave as any)?.credentialId,
+        })
+        const updatedResult = await db
+          .update(webhook)
+          .set({
+            blockId,
+            provider,
+            providerConfig: configToSave,
+            credentialSetId:
+              ((configToSave as Record<string, unknown>)?.credentialSetId as string | null) || null,
+            isActive: true,
+            updatedAt: new Date(),
+          })
+          .where(eq(webhook.id, targetWebhookId))
+          .returning()
+        savedWebhook = updatedResult[0]
+        logger.info(`[${requestId}] Webhook updated successfully`, {
+          webhookId: savedWebhook.id,
+          savedProviderConfig: savedWebhook.providerConfig,
+        })
+      } else {
+        // Create a new webhook
+        const webhookId = nanoid()
+        logger.info(`[${requestId}] Creating new webhook with ID: ${webhookId}`)
+        const newResult = await db
+          .insert(webhook)
+          .values({
+            id: webhookId,
+            workflowId,
+            blockId,
+            path: finalPath,
+            provider,
+            providerConfig: configToSave,
+            credentialSetId:
+              ((configToSave as Record<string, unknown>)?.credentialSetId as string | null) || null,
+            isActive: true,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .returning()
+        savedWebhook = newResult[0]
       }
+    } catch (dbError) {
+      if (externalSubscriptionCreated) {
+        logger.error(`[${requestId}] DB save failed, cleaning up external subscription`, dbError)
+        try {
+          await cleanupExternalWebhook(
+            createTempWebhookData(configToSave),
+            workflowRecord,
+            requestId
+          )
+        } catch (cleanupError) {
+          logger.error(
+            `[${requestId}] Failed to cleanup external subscription after DB save failure`,
+            cleanupError
+          )
+        }
+      }
+      throw dbError
     }
-    // --- End Telegram webhook setup ---
 
-    // --- Gmail webhook setup ---
+    // --- Gmail/Outlook webhook setup (these don't require external subscriptions, configure after DB save) ---
     if (savedWebhook && provider === 'gmail') {
       logger.info(`[${requestId}] Gmail provider detected. Setting up Gmail webhook configuration.`)
       try {
-        const { configureGmailPolling } = await import('@/lib/webhooks/utils')
         const success = await configureGmailPolling(savedWebhook, requestId)
 
         if (!success) {
-          logger.error(`[${requestId}] Failed to configure Gmail polling`)
+          logger.error(`[${requestId}] Failed to configure Gmail polling, rolling back webhook`)
+          await db.delete(webhook).where(eq(webhook.id, savedWebhook.id))
           return NextResponse.json(
             {
               error: 'Failed to configure Gmail polling',
@@ -382,7 +584,11 @@ export async function POST(request: NextRequest) {
 
         logger.info(`[${requestId}] Successfully configured Gmail polling`)
       } catch (err) {
-        logger.error(`[${requestId}] Error setting up Gmail webhook configuration`, err)
+        logger.error(
+          `[${requestId}] Error setting up Gmail webhook configuration, rolling back webhook`,
+          err
+        )
+        await db.delete(webhook).where(eq(webhook.id, savedWebhook.id))
         return NextResponse.json(
           {
             error: 'Failed to configure Gmail webhook',
@@ -400,11 +606,11 @@ export async function POST(request: NextRequest) {
         `[${requestId}] Outlook provider detected. Setting up Outlook webhook configuration.`
       )
       try {
-        const { configureOutlookPolling } = await import('@/lib/webhooks/utils')
         const success = await configureOutlookPolling(savedWebhook, requestId)
 
         if (!success) {
-          logger.error(`[${requestId}] Failed to configure Outlook polling`)
+          logger.error(`[${requestId}] Failed to configure Outlook polling, rolling back webhook`)
+          await db.delete(webhook).where(eq(webhook.id, savedWebhook.id))
           return NextResponse.json(
             {
               error: 'Failed to configure Outlook polling',
@@ -416,7 +622,11 @@ export async function POST(request: NextRequest) {
 
         logger.info(`[${requestId}] Successfully configured Outlook polling`)
       } catch (err) {
-        logger.error(`[${requestId}] Error setting up Outlook webhook configuration`, err)
+        logger.error(
+          `[${requestId}] Error setting up Outlook webhook configuration, rolling back webhook`,
+          err
+        )
+        await db.delete(webhook).where(eq(webhook.id, savedWebhook.id))
         return NextResponse.json(
           {
             error: 'Failed to configure Outlook webhook',
@@ -428,6 +638,55 @@ export async function POST(request: NextRequest) {
     }
     // --- End Outlook specific logic ---
 
+    // --- RSS webhook setup ---
+    if (savedWebhook && provider === 'rss') {
+      logger.info(`[${requestId}] RSS provider detected. Setting up RSS webhook configuration.`)
+      try {
+        const success = await configureRssPolling(savedWebhook, requestId)
+
+        if (!success) {
+          logger.error(`[${requestId}] Failed to configure RSS polling, rolling back webhook`)
+          await db.delete(webhook).where(eq(webhook.id, savedWebhook.id))
+          return NextResponse.json(
+            {
+              error: 'Failed to configure RSS polling',
+              details: 'Please try again',
+            },
+            { status: 500 }
+          )
+        }
+
+        logger.info(`[${requestId}] Successfully configured RSS polling`)
+      } catch (err) {
+        logger.error(
+          `[${requestId}] Error setting up RSS webhook configuration, rolling back webhook`,
+          err
+        )
+        await db.delete(webhook).where(eq(webhook.id, savedWebhook.id))
+        return NextResponse.json(
+          {
+            error: 'Failed to configure RSS webhook',
+            details: err instanceof Error ? err.message : 'Unknown error',
+          },
+          { status: 500 }
+        )
+      }
+    }
+    // --- End RSS specific logic ---
+
+    if (!targetWebhookId && savedWebhook) {
+      try {
+        PlatformEvents.webhookCreated({
+          webhookId: savedWebhook.id,
+          workflowId: workflowId,
+          provider: provider || 'generic',
+          workspaceId: workflowRecord.workspaceId || undefined,
+        })
+      } catch {
+        // Telemetry should not fail the operation
+      }
+    }
+
     const status = targetWebhookId ? 200 : 201
     return NextResponse.json({ webhook: savedWebhook }, { status })
   } catch (error: any) {
@@ -436,115 +695,5 @@ export async function POST(request: NextRequest) {
       stack: error.stack,
     })
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
-  }
-}
-
-// Helper function to create the webhook subscription in Airtable
-async function createAirtableWebhookSubscription(
-  request: NextRequest,
-  userId: string,
-  webhookData: any,
-  requestId: string
-) {
-  try {
-    const { path, providerConfig } = webhookData
-    const { baseId, tableId, includeCellValuesInFieldIds } = providerConfig || {}
-
-    if (!baseId || !tableId) {
-      logger.warn(`[${requestId}] Missing baseId or tableId for Airtable webhook creation.`, {
-        webhookId: webhookData.id,
-      })
-      return // Cannot proceed without base/table IDs
-    }
-
-    const accessToken = await getOAuthToken(userId, 'airtable')
-    if (!accessToken) {
-      logger.warn(
-        `[${requestId}] Could not retrieve Airtable access token for user ${userId}. Cannot create webhook in Airtable.`
-      )
-      throw new Error(
-        'Airtable account connection required. Please connect your Airtable account in the trigger configuration and try again.'
-      )
-    }
-
-    const notificationUrl = `${getBaseUrl()}/api/webhooks/trigger/${path}`
-
-    const airtableApiUrl = `https://api.airtable.com/v0/bases/${baseId}/webhooks`
-
-    const specification: any = {
-      options: {
-        filters: {
-          dataTypes: ['tableData'], // Watch table data changes
-          recordChangeScope: tableId, // Watch only the specified table
-        },
-      },
-    }
-
-    // Conditionally add the 'includes' field based on the config
-    if (includeCellValuesInFieldIds === 'all') {
-      specification.options.includes = {
-        includeCellValuesInFieldIds: 'all',
-      }
-    }
-
-    const requestBody: any = {
-      notificationUrl: notificationUrl,
-      specification: specification,
-    }
-
-    const airtableResponse = await fetch(airtableApiUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(requestBody),
-    })
-
-    // Airtable often returns 200 OK even for errors in the body, check payload
-    const responseBody = await airtableResponse.json()
-
-    if (!airtableResponse.ok || responseBody.error) {
-      const errorMessage =
-        responseBody.error?.message || responseBody.error || 'Unknown Airtable API error'
-      const errorType = responseBody.error?.type
-      logger.error(
-        `[${requestId}] Failed to create webhook in Airtable for webhook ${webhookData.id}. Status: ${airtableResponse.status}`,
-        { type: errorType, message: errorMessage, response: responseBody }
-      )
-    } else {
-      logger.info(
-        `[${requestId}] Successfully created webhook in Airtable for webhook ${webhookData.id}.`,
-        {
-          airtableWebhookId: responseBody.id,
-        }
-      )
-      // Store the airtableWebhookId (responseBody.id) within the providerConfig
-      try {
-        const currentConfig = (webhookData.providerConfig as Record<string, any>) || {}
-        const updatedConfig = {
-          ...currentConfig,
-          externalId: responseBody.id, // Add/update the externalId
-        }
-        await db
-          .update(webhook)
-          .set({ providerConfig: updatedConfig, updatedAt: new Date() })
-          .where(eq(webhook.id, webhookData.id))
-      } catch (dbError: any) {
-        logger.error(
-          `[${requestId}] Failed to store externalId in providerConfig for webhook ${webhookData.id}.`,
-          dbError
-        )
-        // Even if saving fails, the webhook exists in Airtable. Log and continue.
-      }
-    }
-  } catch (error: any) {
-    logger.error(
-      `[${requestId}] Exception during Airtable webhook creation for webhook ${webhookData.id}.`,
-      {
-        message: error.message,
-        stack: error.stack,
-      }
-    )
   }
 }

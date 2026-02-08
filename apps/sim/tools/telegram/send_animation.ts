@@ -1,3 +1,4 @@
+import { ErrorExtractorId } from '@/tools/error-extractors'
 import type {
   TelegramMedia,
   TelegramSendAnimationParams,
@@ -14,6 +15,7 @@ export const telegramSendAnimationTool: ToolConfig<
   name: 'Telegram Send Animation',
   description: 'Send animations (GIFs) to Telegram channels or users through the Telegram Bot API.',
   version: '1.0.0',
+  errorExtractor: ErrorExtractorId.TELEGRAM_DESCRIPTION,
 
   params: {
     botToken: {
@@ -25,8 +27,8 @@ export const telegramSendAnimationTool: ToolConfig<
     chatId: {
       type: 'string',
       required: true,
-      visibility: 'user-only',
-      description: 'Target Telegram chat ID',
+      visibility: 'user-or-llm',
+      description: 'Telegram chat ID (numeric, can be negative for groups)',
     },
     animation: {
       type: 'string',
@@ -66,11 +68,18 @@ export const telegramSendAnimationTool: ToolConfig<
 
   transformResponse: async (response: Response) => {
     const data = await response.json()
+
+    if (!data.ok) {
+      const errorMessage = data.description || data.error || 'Failed to send animation'
+      throw new Error(errorMessage)
+    }
+
     const result = data.result as TelegramMedia
+
     return {
-      success: data.ok,
+      success: true,
       output: {
-        message: data.ok ? 'Animation sent successfully' : 'Failed to send animation',
+        message: 'Animation sent successfully',
         data: result,
       },
     }
