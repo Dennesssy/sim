@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: sim-studio
+    runtime: docker
+    repo: https://github.com/simstudioai/sim.git
+    plan: starter
+    region: oregon
+    envVars:
+      - key: DATABASE_URL
+        sync: false # You'll want to provide your actual DB URL in the Render Dashboard
+      - key: NEXT_PUBLIC_APP_URL
+        value: https://sim-studio.onrender.com
+      - key: BETTER_AUTH_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: INTERNAL_API_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production
