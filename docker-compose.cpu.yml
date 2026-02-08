@@ -1,0 +1,84 @@
+name: sim-cpu
+
+services:
+  simstudio:
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    ports:
+      - '3000:3000'
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-simstudio}
+      - NEXT_PUBLIC_APP_URL=http://localhost:3000
+      - BETTER_AUTH_URL=http://localhost:3000
+      - BETTER_AUTH_SECRET=sim_auth_secret_$(openssl rand -hex 16)
+      - ENCRYPTION_KEY=$(openssl rand -hex 32)
+      # OLLAMA_URL REMOVED
+    depends_on:
+      db:
+        condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
+      realtime:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3000']
+      interval: 90s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  realtime:
+    build:
+      context: .
+      dockerfile: docker/realtime.Dockerfile
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-simstudio}
+      - NEXT_PUBLIC_APP_URL=http://localhost:3000
+      - BETTER_AUTH_URL=http://localhost:3000
+      - BETTER_AUTH_SECRET=sim_auth_secret_$(openssl rand -hex 16)
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - '3002:3002'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3002/health']
+      interval: 90s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  migrations:
+    build:
+      context: .
+      dockerfile: docker/db.Dockerfile
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-simstudio}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ['bun', 'run', 'db:migrate']
+    restart: 'no'
+
+  db:
+    image: pgvector/pgvector:pg17
+    restart: always
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-simstudio}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
